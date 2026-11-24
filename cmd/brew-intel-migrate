@@ -1,0 +1,452 @@
+#!/bin/bash
+#:  * `intel-migrate` <command> [<options>]
+#:
+#:  Move the tools you still use from an old Intel Homebrew (/usr/local) to
+#:  Apple Silicon Homebrew (/opt/homebrew), then remove the Intel install.
+#:
+#:  Commands, in the order you run them:
+#:    inventory   List what the Intel install holds. Read-only.
+#:    plan        Write an editable migration plan. Read-only apart from the plan file.
+#:    install     Install the plan's tools into /opt/homebrew (needs --yes).
+#:    uninstall   Remove the Intel Homebrew (needs --yes; asks for sudo).
+#:
+#:  Options:
+#:    --since <N>[d|m|y]  plan: keep tools used within this period (default 12m).
+#:    --all               plan: keep every tool, however long unused.
+#:    --plan <file>       Plan file (default ~/.config/brew-intel-migrate/plan.tsv).
+#:    --yes               install/uninstall: actually make the changes.
+#:    --discard-data      uninstall: also delete database data in /usr/local/var.
+#:    --version           Print the version.
+#:    -h, --help          Print this help.
+
+set -uo pipefail
+
+VERSION="0.1.0"
+INTEL_PREFIX="${BIM_INTEL_PREFIX:-/usr/local}"
+ARM_PREFIX="${BIM_ARM_PREFIX:-/opt/homebrew}"
+ARCH="${BIM_ARCH:-$(uname -m)}"
+SUDO="${BIM_SUDO-sudo}"
+UNINSTALL_URL="https://raw.githubusercontent.com/Homebrew/install/HEAD/uninstall.sh"
+PLAN_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/brew-intel-migrate/plan.tsv"
+SINCE="12m"
+ALL=0
+YES=0
+DISCARD=0
+TAB="$(printf '\t')"
+
+die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
+info() { printf '==> %s\n' "$*"; }
+warn() { printf 'Warning: %s\n' "$*" >&2; }
+
+usage() { sed -n 's/^#:  \{0,1\}//p' "$0"; }
+
+arm_brew() { "${BIM_ARM_BREW:-$ARM_PREFIX/bin/brew}" "$@"; }
+
+intel_brew() {
+  if [ -n "${BIM_INTEL_BREW:-}" ]; then
+    "$BIM_INTEL_BREW" "$@"
+  else
+    arch -x86_64 "$INTEL_PREFIX/bin/brew" "$@"
+  fi
+}
+
+run_sudo() {
+  if [ -n "$SUDO" ]; then "$SUDO" "$@"; else "$@"; fi
+}
+
+# json_get <file> <key.path>: prints a scalar from a JSON file (macOS plutil).
+json_get() { plutil -extract "$2" raw -o - "$1" 2>/dev/null; }
+
+fmt_date() {
+  if [ -n "$1" ] && [ "$1" != "-" ]; then date -r "$1" +%Y-%m-%d; else printf -- '-'; fi
+}
+
+since_days() {
+  local v="$1" n u
+  n="${v%[dmy]}"
+  u="${v#"$n"}"
+  case "$n" in '' | *[!0-9]*) die "--since takes a number with d, m or y, for example 12m" ;; esac
+  case "$u" in
+    d) echo "$n" ;;
+    m) echo $((n * 30)) ;;
+    y) echo $((n * 365)) ;;
+    *) die "--since takes a number with d, m or y, for example 12m" ;;
+  esac
+}
+
+# latest_atime <path>...: newest access time (epoch) among existing paths, or nothing.
+latest_atime() {
+  local max="" t f
+  for f in "$@"; do
+    [ -e "$f" ] || continue
+    t=$(stat -L -f %a "$f" 2>/dev/null) || continue
+    if [ -z "$max" ] || [ "$t" -gt "$max" ]; then max=$t; fi
+  done
+  printf '%s' "$max"
+}
+
+# Known differences between the Intel and Apple Silicon names.
+map_target() {
+  case "$1" in
+    cask:git-credential-manager-core) echo "cask:git-credential-manager" ;;
+    cask:powershell) echo "formula:powershell" ;;
+    *) echo "$1" ;;
+  esac
+}
+
+# target_status <kind:name>: installed | available | tap:<tap> | unavailable | disabled
+target_status() {
+  local kind="${1%%:*}" name="${1#*:}" base out key
+  base="${name##*/}"
+  if [ "$kind" = formula ]; then
+    [ -d "$ARM_PREFIX/Cellar/$base" ] && { echo installed; return; }
+    key=formulae
+  else
+    [ -d "$ARM_PREFIX/Caskroom/$base" ] && { echo installed; return; }
+    key=casks
+  fi
+  case "$name" in */*/*) echo "tap:${name%/*}"; return ;; esac
+  out=$(mktemp)
+  if arm_brew info --json=v2 "--$kind" "$name" >"$out" 2>/dev/null; then
+    if [ "$(json_get "$out" "$key.0.disabled")" = "true" ]; then echo disabled; else echo available; fi
+  else
+    echo unavailable
+  fi
+  rm -f "$out"
+}
+
+intel_present() { [ -d "$INTEL_PREFIX/Cellar" ] || [ -d "$INTEL_PREFIX/Caskroom" ] || [ -d "$INTEL_PREFIX/Homebrew" ]; }
+
+require_env() {
+  [ "$ARCH" = "arm64" ] || die "this command is for Apple Silicon Macs (found $ARCH)."
+  [ "$INTEL_PREFIX" != "$ARM_PREFIX" ] || die "Intel and Apple Silicon prefixes are the same ($ARM_PREFIX)."
+  [ -x "${BIM_ARM_BREW:-$ARM_PREFIX/bin/brew}" ] || die "Apple Silicon Homebrew not found at $ARM_PREFIX. Install it first: https://brew.sh"
+  if ! intel_present; then
+    info "No Intel Homebrew found at $INTEL_PREFIX. Nothing to do."
+    exit 0
+  fi
+}
+
+# collect: one row per formula installed on request and per cask:
+# kind<TAB>name<TAB>target<TAB>last-use epoch or -<TAB>status
+collect() {
+  local d f r tap target last status
+  for d in "$INTEL_PREFIX"/Cellar/*/; do
+    [ -d "$d" ] || continue
+    f=$(basename "$d")
+    r=""
+    for r in "$d"*/INSTALL_RECEIPT.json; do :; done
+    [ -f "$r" ] || continue
+    [ "$(json_get "$r" installed_on_request)" = "true" ] || continue
+    tap=$(json_get "$r" source.tap) || tap=""
+    case "$tap" in '' | homebrew/core) target="formula:$f" ;; *) target="formula:$tap/$f" ;; esac
+    target=$(map_target "$target")
+    last=$(latest_atime "$d"*/bin/* "$d"*/sbin/*)
+    status=$(target_status "$target")
+    printf 'formula\t%s\t%s\t%s\t%s\n' "$f" "$target" "${last:--}" "$status"
+  done
+  for d in "$INTEL_PREFIX"/Caskroom/*/; do
+    [ -d "$d" ] || continue
+    f=$(basename "$d")
+    target=$(map_target "cask:$f")
+    last=$(latest_atime "$d"*/*)
+    status=$(target_status "$target")
+    printf 'cask\t%s\t%s\t%s\t%s\n' "$f" "$target" "${last:--}" "$status"
+  done
+}
+
+data_dirs() {
+  local d
+  for d in "$INTEL_PREFIX"/var/mysql "$INTEL_PREFIX"/var/postgres* "$INTEL_PREFIX"/var/mongodb "$INTEL_PREFIX"/var/redis*; do
+    [ -d "$d" ] && echo "$d"
+  done
+}
+
+report_extras() {
+  local d h files f found
+  info "Database data in $INTEL_PREFIX/var (kept unless you pass --discard-data to uninstall)"
+  found=0
+  while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    printf '  %s (%s)\n' "$d" "$(du -sh "$d" 2>/dev/null | cut -f1)"
+    found=1
+  done <<EOF
+$(data_dirs)
+EOF
+  [ "$found" = 1 ] || echo "  none"
+
+  info "Git credential helper"
+  found=0
+  while IFS= read -r h; do
+    [ -n "$h" ] || continue
+    found=1
+    case "$h" in
+      "$INTEL_PREFIX"/Cellar/* | "$INTEL_PREFIX"/opt/* | "$INTEL_PREFIX"/Caskroom/*)
+        printf '  %s  <- breaks when the Intel Homebrew is removed\n' "$h" ;;
+      *) printf '  %s\n' "$h" ;;
+    esac
+  done <<EOF
+$(git config --global --get-all credential.helper 2>/dev/null)
+EOF
+  [ "$found" = 1 ] || echo "  none"
+
+  info "Shell files and LaunchAgents that point into the Intel Homebrew (edit these yourself)"
+  files=""
+  for f in "$HOME/.zshrc" "$HOME/.zprofile" "$HOME/.zshenv" "$HOME/.bashrc" "$HOME/.bash_profile" \
+    "$HOME/.profile" "$HOME/.config/fish/config.fish" "$HOME"/Library/LaunchAgents/*.plist; do
+    [ -f "$f" ] && files="$files$f$TAB"
+  done
+  found=0
+  if [ -n "$files" ]; then
+    local IFS="$TAB"
+    # shellcheck disable=SC2086
+    if grep -HnE "$INTEL_PREFIX/(opt|Cellar|Caskroom|Homebrew)/" $files 2>/dev/null | sed 's/^/  /'; then found=1; fi
+  fi
+  [ "$found" = 1 ] || echo "  none"
+}
+
+cmd_inventory() {
+  require_env
+  local rows nform nreq ncask
+  rows=$(collect)
+  nform=$(find "$INTEL_PREFIX/Cellar" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
+  ncask=$(find "$INTEL_PREFIX/Caskroom" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
+  nreq=$(printf '%s\n' "$rows" | grep -c "^formula$TAB")
+  info "Intel Homebrew at $INTEL_PREFIX: $nform formulae ($nreq you installed, the rest are dependencies), $ncask casks"
+  {
+    printf 'KIND\tNAME\tLAST USED\tON APPLE SILICON\n'
+    printf '%s\n' "$rows" | while IFS="$TAB" read -r kind name target last status; do
+      [ -n "$kind" ] || continue
+      case "$status" in
+        installed) status="installed already" ;;
+        available) status="available as ${target#*:}" ;;
+        tap:*) status="available from tap ${status#tap:}" ;;
+        unavailable) status="not available" ;;
+        disabled) status="disabled in Homebrew" ;;
+      esac
+      printf '%s\t%s\t%s\t%s\n' "$kind" "$name" "$(fmt_date "$last")" "$status"
+    done
+  } | column -t -s "$TAB"
+  echo
+  report_extras
+  echo
+  echo "Next: brew intel-migrate plan"
+}
+
+cmd_plan() {
+  require_env
+  local days cutoff
+  days=$(since_days "$SINCE")
+  cutoff=$(($(date +%s) - days * 86400))
+  mkdir -p "$(dirname "$PLAN_FILE")" || die "cannot create $(dirname "$PLAN_FILE")"
+  {
+    echo "# brew intel-migrate plan, written $(date +%Y-%m-%d)."
+    echo "# Edit the first column: install, drop or skip. Columns are tab-separated."
+    echo "# 'install' puts the target into $ARM_PREFIX; 'drop' and 'skip' leave it out."
+    printf '# action\tkind\tname\ttarget\tlast used\treason\n'
+    collect | while IFS="$TAB" read -r kind name target last status; do
+      [ -n "$kind" ] || continue
+      action=install
+      case "$status" in
+        installed) action=skip reason="already on Apple Silicon" ;;
+        unavailable) action=drop reason="not available for Apple Silicon" ;;
+        disabled) action=drop reason="disabled in Homebrew" ;;
+        *)
+          if [ "$ALL" = 0 ] && [ "$last" != "-" ] && [ "$last" -lt "$cutoff" ]; then
+            action=drop reason="not used within $SINCE"
+          elif [ "$last" = "-" ]; then
+            reason="last use unknown, kept to be safe"
+          else
+            reason="used within $SINCE"
+          fi
+          [ "$ALL" = 1 ] && [ "$action" = install ] && reason="kept by --all"
+          ;;
+      esac
+      printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$action" "$kind" "$name" "$target" "$(fmt_date "$last")" "$reason"
+    done
+  } >"$PLAN_FILE.tmp" || die "cannot write $PLAN_FILE"
+  mv "$PLAN_FILE.tmp" "$PLAN_FILE" || die "cannot write $PLAN_FILE"
+
+  grep -v '^#' "$PLAN_FILE" | column -t -s "$TAB"
+  echo
+  info "Plan: $(count_action install) to install, $(count_action drop) to drop, $(count_action skip) already on Apple Silicon"
+  echo "Saved to $PLAN_FILE. Review or edit it, then: brew intel-migrate install --yes"
+}
+
+count_action() { grep -c "^$1$TAB" "$PLAN_FILE" 2>/dev/null || true; }
+
+require_plan() {
+  [ -f "$PLAN_FILE" ] || die "no plan at $PLAN_FILE. Run: brew intel-migrate plan"
+}
+
+# plan_installs: target of each 'install' row.
+plan_installs() { awk -F "$TAB" '$1 == "install" { print $4 }' "$PLAN_FILE"; }
+
+post_install() {
+  case "$1" in
+    formula:libpq) arm_brew link --force libpq </dev/null || warn "could not link libpq" ;;
+  esac
+}
+
+cmd_install() {
+  require_env
+  require_plan
+  local targets t kind name failed=0
+  targets=$(plan_installs)
+  if [ -z "$targets" ]; then
+    info "The plan has nothing to install."
+    return 0
+  fi
+  info "To install into $ARM_PREFIX:"
+  printf '%s\n' "$targets" | sed 's/^/  /'
+  if [ "$YES" != 1 ]; then
+    echo "Nothing was installed. Run again with --yes to install."
+    return 0
+  fi
+  while IFS= read -r t <&3; do
+    kind="${t%%:*}"
+    name="${t#*:}"
+    if [ "$(target_status "$t")" = installed ]; then
+      info "$name is already installed"
+      continue
+    fi
+    case "$name" in */*/*) arm_brew tap "${name%/*}" </dev/null || warn "could not tap ${name%/*}" ;; esac
+    info "Installing $name"
+    if [ "$kind" = cask ]; then
+      arm_brew install --cask "$name" </dev/null
+    else
+      arm_brew install "$name" </dev/null
+    fi || { warn "failed to install $name"; failed=$((failed + 1)); continue; }
+    post_install "$t"
+  done 3<<EOF
+$targets
+EOF
+
+  info "Check"
+  local missing=0
+  while IFS= read -r t; do
+    if [ "$(target_status "$t")" = installed ]; then
+      printf '  ok       %s\n' "${t#*:}"
+    else
+      printf '  MISSING  %s\n' "${t#*:}"
+      missing=$((missing + 1))
+    fi
+  done <<EOF
+$targets
+EOF
+  if [ "$missing" -gt 0 ]; then
+    die "$missing planned tool(s) are not installed. Fix them, or mark them 'drop' in $PLAN_FILE."
+  fi
+  echo "All planned tools are installed. Next: brew intel-migrate uninstall"
+}
+
+cleanup_links() {
+  local l t
+  find "$INTEL_PREFIX" -type l 2>/dev/null | while IFS= read -r l; do
+    [ -e "$l" ] && continue
+    t=$(readlink "$l")
+    case "$t" in
+      *Homebrew* | *Cellar* | *Caskroom*)
+        rm -f "$l" 2>/dev/null || run_sudo rm -f "$l"
+        [ -L "$l" ] || printf '  removed %s\n' "$l"
+        ;;
+    esac
+  done
+}
+
+cmd_uninstall() {
+  require_env
+  require_plan
+  local t missing="" script tmp="" d dirs
+  while IFS= read -r t; do
+    [ -n "$t" ] || continue
+    [ "$(target_status "$t")" = installed ] || missing="$missing ${t#*:}"
+  done <<EOF
+$(plan_installs)
+EOF
+  [ -z "$missing" ] || die "the plan still lists tools not installed on Apple Silicon:$missing. Run: brew intel-migrate install --yes"
+
+  if [ -n "${BIM_UNINSTALL_SCRIPT:-}" ]; then
+    script="$BIM_UNINSTALL_SCRIPT"
+  else
+    tmp=$(mktemp)
+    curl -fsSL "$UNINSTALL_URL" -o "$tmp" || die "could not download Homebrew's uninstaller from $UNINSTALL_URL"
+    script="$tmp"
+  fi
+
+  info "Dry run of Homebrew's official uninstaller for $INTEL_PREFIX"
+  /bin/bash "$script" --path="$INTEL_PREFIX" --dry-run
+
+  dirs=$(data_dirs)
+  if [ -n "$dirs" ]; then
+    if [ "$DISCARD" = 1 ]; then info "Database data that will be deleted (--discard-data):"; else info "Database data that will be kept:"; fi
+    printf '%s\n' "$dirs" | sed 's/^/  /'
+  fi
+
+  if [ "$YES" != 1 ]; then
+    [ -n "$tmp" ] && rm -f "$tmp"
+    echo "Nothing was removed. Run again with --yes to uninstall."
+    return 0
+  fi
+
+  if [ -n "$SUDO" ]; then "$SUDO" -v || die "sudo is needed to remove $INTEL_PREFIX files"; fi
+  intel_brew services stop --all >/dev/null 2>&1 || true
+
+  if [ "$DISCARD" = 1 ] && [ -n "$dirs" ]; then
+    while IFS= read -r d; do
+      rm -rf "$d" 2>/dev/null || run_sudo rm -rf "$d"
+      printf '  deleted %s\n' "$d"
+    done <<EOF
+$dirs
+EOF
+  fi
+
+  info "Running Homebrew's uninstaller"
+  NONINTERACTIVE=1 /bin/bash "$script" --path="$INTEL_PREFIX" --force ||
+    warn "the uninstaller reported errors; cleaning up what it left"
+  [ -n "$tmp" ] && rm -f "$tmp"
+
+  info "Removing leftover Homebrew links"
+  cleanup_links
+
+  info "Check"
+  local left=""
+  for d in Cellar Caskroom Homebrew bin/brew; do
+    [ -e "$INTEL_PREFIX/$d" ] && left="$left $INTEL_PREFIX/$d"
+  done
+  [ -z "$left" ] || die "still present:$left"
+  echo "  Intel Homebrew removed from $INTEL_PREFIX."
+  echo "  Open a new terminal so your shell forgets the old paths."
+  report_extras | sed -n '/Shell files/,$p'
+}
+
+main() {
+  local cmd=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h | --help) usage; exit 0 ;;
+      --version) echo "brew-intel-migrate $VERSION"; exit 0 ;;
+      --since) [ $# -ge 2 ] || die "--since needs a value"; SINCE="$2"; shift ;;
+      --since=*) SINCE="${1#--since=}" ;;
+      --all) ALL=1 ;;
+      --plan) [ $# -ge 2 ] || die "--plan needs a file"; PLAN_FILE="$2"; shift ;;
+      --plan=*) PLAN_FILE="${1#--plan=}" ;;
+      --yes) YES=1 ;;
+      --discard-data) DISCARD=1 ;;
+      -*) die "unknown option $1 (see --help)" ;;
+      *) [ -z "$cmd" ] || die "one command at a time (got $cmd and $1)"; cmd="$1" ;;
+    esac
+    shift
+  done
+  since_days "$SINCE" >/dev/null
+  case "$cmd" in
+    inventory) cmd_inventory ;;
+    plan) cmd_plan ;;
+    install) cmd_install ;;
+    uninstall) cmd_uninstall ;;
+    "") usage ;;
+    *) die "unknown command $cmd (see --help)" ;;
+  esac
+}
+
+main "$@"

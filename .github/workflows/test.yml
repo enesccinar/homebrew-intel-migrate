@@ -1,0 +1,21 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck and bats
+        run: brew install shellcheck bats-core
+      - name: Lint
+        run: shellcheck -s bash cmd/brew-intel-migrate test/helpers.bash
+      - name: Test
+        run: bats test
