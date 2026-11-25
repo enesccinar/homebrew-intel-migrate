@@ -242,3 +242,176 @@ setup() { setup_fakes; }
   ! grep -q "^intel uninstall" "$CALLS"
   [ -f "$BIM_INTEL_PREFIX/share/gcm-core/git-credential-manager" ]
 }
+
+# --- 0.2.0: commands that disappear with the Intel Homebrew ---
+
+@test "inventory lists a dependency's command that nothing else provides (corepack case)" {
+  add_formula jq
+  available jq
+  intel_command corepack node 2
+  intel_command node node 2
+  mkdir -p "$BIM_ARM_PREFIX/Cellar/node"
+  touch "$BIM_ARM_PREFIX/bin/node"
+  run "$CMD" inventory
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Commands that only the Intel Homebrew provides"* ]]
+  [[ "$output" == *"corepack"*"formula node"*"corepack package"* ]]
+  # node exists on Apple Silicon, so it is not listed as disappearing
+  ! printf '%s\n' "$output" | sed -n '/Commands that only/,/^==>/p' | grep -qE '^  node '
+}
+
+@test "commands also found in system folders are not listed" {
+  add_formula jq
+  available jq
+  intel_command make make
+  touch "$BIM_SYSTEM_DIRS/make"
+  run "$CMD" inventory
+  [ "$status" -eq 0 ]
+  printf '%s\n' "$output" | sed -n '/Commands that only/,/^==>/p' | grep -q "  none"
+}
+
+@test "plan adds the corepack package for a recently used corepack" {
+  add_formula jq
+  available jq corepack
+  intel_command corepack node 2
+  run "$CMD" plan
+  [ "$status" -eq 0 ]
+  grep -q "^install	command	corepack	formula:corepack	.*corepack provides it" "$PLAN"
+}
+
+@test "plan drops an old corepack it was not using" {
+  add_formula jq
+  available jq corepack
+  intel_command corepack node 800
+  run "$CMD" plan
+  grep -q "^drop	command	corepack	" "$PLAN"
+}
+
+@test "plan marks an unreplaceable recently used command as missing, and uninstall refuses" {
+  add_formula jq
+  available jq
+  intel_command oldtool libold 3
+  run "$CMD" plan
+  [ "$status" -eq 0 ]
+  grep -q "^missing	command	oldtool	-	" "$PLAN"
+  [[ "$output" == *"1 missing"* ]]
+  "$CMD" install --yes >/dev/null
+  run "$CMD" uninstall --yes
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"would disappear and nothing replaces them: oldtool"* ]]
+  [ -d "$BIM_INTEL_PREFIX/Cellar" ]
+}
+
+@test "dropping a missing command in the plan lets uninstall go ahead" {
+  add_formula jq
+  available jq
+  intel_command oldtool libold 3
+  "$CMD" plan >/dev/null
+  sed -i '' 's/^missing	command	oldtool/drop	command	oldtool/' "$PLAN"
+  "$CMD" install --yes >/dev/null
+  run "$CMD" uninstall --yes
+  [ "$status" -eq 0 ]
+  [ ! -e "$BIM_INTEL_PREFIX/Cellar" ]
+}
+
+@test "a command from a package the plan drops is not marked missing" {
+  add_formula wget true homebrew/core 500
+  available wget
+  intel_command wget wget 500
+  run "$CMD" plan
+  grep -q "^drop	formula	wget	" "$PLAN"
+  ! grep -q "	command	wget	" "$PLAN"
+}
+
+@test "uninstall catches a command the Apple Silicon package no longer ships" {
+  add_formula node true homebrew/core 2
+  available node
+  intel_command corepack node 2
+  "$CMD" plan >/dev/null
+  # Simulate an old plan without the corepack row (made before 0.2.0).
+  sed -i '' '/	command	corepack	/d' "$PLAN"
+  "$CMD" install --yes >/dev/null
+  run "$CMD" uninstall --yes
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"no decision for them: corepack"* ]]
+  [ -d "$BIM_INTEL_PREFIX/Cellar" ]
+}
+
+@test "install puts corepack in, check finds the command, uninstall then succeeds" {
+  add_formula jq
+  available jq corepack
+  provides corepack corepack yarn yarnpkg pnpm pnpx
+  intel_command corepack node 2
+  "$CMD" plan >/dev/null
+  run "$CMD" install --yes
+  [ "$status" -eq 0 ]
+  grep -q "^arm install corepack$" "$CALLS"
+  [[ "$output" == *"ok       command corepack"* ]]
+  run "$CMD" uninstall --yes
+  [ "$status" -eq 0 ]
+}
+
+@test "corepack replaces yarn: plan drops yarn, install uninstalls Apple Silicon yarn first" {
+  add_formula yarn true homebrew/core 2
+  available yarn corepack
+  conflicts corepack yarn pnpm hadoop
+  provides corepack corepack yarn yarnpkg pnpm pnpx
+  intel_command corepack node 2
+  mkdir -p "$BIM_ARM_PREFIX/Cellar/yarn" # yarn already on Apple Silicon
+  run "$CMD" plan
+  [ "$status" -eq 0 ]
+  run "$CMD" install
+  [[ "$output" == *"To uninstall from"*"yarn"* ]]
+  [ -d "$BIM_ARM_PREFIX/Cellar/yarn" ]
+  ! grep -q "^arm uninstall" "$CALLS"
+  run "$CMD" install --yes
+  [ "$status" -eq 0 ]
+  grep -q "^arm uninstall --formula yarn$" "$CALLS"
+  grep -q "^arm install corepack$" "$CALLS"
+  [ -d "$BIM_ARM_PREFIX/Cellar/corepack" ]
+}
+
+@test "a conflict corepack does not replace is kept, and the failed install is reported" {
+  add_formula jq
+  available jq corepack
+  conflicts corepack yarn pnpm hadoop
+  intel_command corepack node 2
+  mkdir -p "$BIM_ARM_PREFIX/Cellar/hadoop"
+  "$CMD" plan >/dev/null
+  run "$CMD" install --yes
+  [ "$status" -ne 0 ]
+  ! grep -q "^arm uninstall --formula hadoop$" "$CALLS"
+  [ -d "$BIM_ARM_PREFIX/Cellar/hadoop" ]
+  [[ "$output" == *"MISSING  command corepack"* ]]
+}
+
+@test "plan drops Intel yarn when corepack is planned" {
+  add_formula yarn true homebrew/core 2
+  available yarn corepack
+  intel_command corepack node 2
+  run "$CMD" plan
+  grep -q "^drop	formula	yarn	.*corepack provides it" "$PLAN"
+}
+
+@test "inventory lists LaunchAgents with /usr/local/bin on their PATH" {
+  add_formula jq
+  available jq
+  launch_agent com.example.daemon "/opt/homebrew/bin:$BIM_INTEL_PREFIX/bin:/usr/bin"
+  launch_agent com.example.clean "/opt/homebrew/bin:/usr/bin"
+  run "$CMD" inventory
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"com.example.daemon.plist"* ]]
+  [[ "$output" != *"com.example.clean.plist"* ]]
+}
+
+@test "cask last use comes from the installed app" {
+  add_cask myapp 900
+  available myapp
+  mkdir -p "$BIM_INTEL_PREFIX/Caskroom/myapp/.metadata"
+  printf '{"uninstall_artifacts":[{"app":["My App.app"]}]}' >"$BIM_INTEL_PREFIX/Caskroom/myapp/.metadata/INSTALL_RECEIPT.json"
+  mkdir -p "$BIM_APP_DIRS/My App.app/Contents/MacOS"
+  touch "$BIM_APP_DIRS/My App.app/Contents/MacOS/myapp"
+  run "$CMD" plan
+  [ "$status" -eq 0 ]
+  grep -q "^install	cask	myapp	cask:myapp	$(date +%Y-%m-%d)	" "$PLAN"
+}

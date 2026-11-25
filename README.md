@@ -42,21 +42,34 @@ Without `--yes`, `install` and `uninstall` only show what they would do.
 Lists, without changing anything:
 
 - formulae you installed yourself (dependencies are left out) and casks
-- when each was last used, from the access time of its programs
+- when each was last used: for formulae, from the access time of their
+  programs; for casks, from the app in `/Applications`
 - whether each exists for Apple Silicon, and under which name or tap
+- commands that only the Intel install provides, so they disappear with it.
+  This checks every command in `/usr/local/bin` and `/usr/local/sbin`, from
+  dependencies too, against `/opt/homebrew` and the system folders. It catches
+  commands an Apple Silicon package no longer ships, such as `corepack`, which
+  Node.js 25 and later stopped bundling
 - database data in `/usr/local/var` (MySQL, PostgreSQL, MongoDB, Redis)
 - your git credential helper, if it points into the Intel install
 - shell files and LaunchAgents that still point into the Intel install
+- LaunchAgents that have `/usr/local/bin` on their PATH. They find commands
+  by name, so a command that disappears breaks them without any path to the
+  Intel install in the file
 
 ### plan
 
 Writes `~/.config/brew-intel-migrate/plan.tsv` (use `--plan <file>` for
-another path). Each row is `install`, `drop` or `skip`:
+another path). Each row is `install`, `drop`, `skip` or `missing`:
 
 - `install`: used within the last 12 months and available for Apple Silicon
 - `drop`: unused for longer, or not available for Apple Silicon
   (for example `python@3.8` or `node@18`)
 - `skip`: already installed in `/opt/homebrew`
+- `missing`: a command you used within the last 12 months that nothing on
+  Apple Silicon provides. `uninstall` refuses while any is left. Change it to
+  `drop` to accept losing it, or give it a package target
+  (`formula:<name>` or `cask:<name>`) and `install`
 
 Change the cut-off with `--since 6m`, `--since 2y` or `--since 90d`, or keep
 everything with `--all`. Edit the first column by hand to change any row.
@@ -69,16 +82,30 @@ Known renames are handled:
 | cask `powershell` | formula `powershell` |
 | formulae from third-party taps | tapped first, then installed |
 | `libpq` (keg-only) | installed and linked, so `psql` is on your PATH |
+| `corepack` (bundled with Intel `node`) | formula `corepack` |
+
+Homebrew's `corepack` conflicts with its `yarn` and `pnpm` formulae, and
+provides the `yarn` and `pnpm` commands itself. When the plan installs
+`corepack`, it drops Intel `yarn` and `pnpm`, and `install` uninstalls them
+from `/opt/homebrew` first. Your global pnpm from `pnpm self-update` or
+`~/Library/pnpm` is not touched.
 
 ### install --yes
 
-Installs every `install` row into `/opt/homebrew`, then checks each one is
-there. If any fail, it stops and says which, so you can fix them or mark them
-`drop`.
+Installs every `install` row into `/opt/homebrew`, then checks each package
+is there and each planned command is on the PATH. If any fail, it stops and
+says which, so you can fix them or mark them `drop`.
+
+Packages from third-party taps are installed by their full name (for example
+`mongodb/brew/mongodb-database-tools`), which Homebrew 7 and later treat as
+trusting that one package.
 
 ### uninstall --yes
 
-1. Refuses while any planned tool is missing from `/opt/homebrew`.
+1. Refuses while any planned tool is missing from `/opt/homebrew`, while any
+   row is still `missing`, and while any command used within the last 12
+   months would disappear without a `drop` in the plan. That last check runs
+   again at this point, so an old plan or a package that changed is caught.
 2. Downloads [Homebrew's official uninstaller](https://github.com/Homebrew/install)
    and shows its dry run for `/usr/local`.
 3. Asks for your sudo password (files in `/usr/local` are often owned by root
