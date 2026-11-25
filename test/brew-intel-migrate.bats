@@ -11,6 +11,7 @@ setup() { setup_fakes; }
   run "$CMD" --help
   [ "$status" -eq 0 ]
   [[ "$output" == *"inventory"* && "$output" == *"uninstall"* ]]
+  [[ "$output" == *"missing"* && "$output" == *"would disappear"* ]]
 }
 
 @test "unknown command and option fail" {

@@ -5,10 +5,15 @@
 #:  Apple Silicon Homebrew (/opt/homebrew), then remove the Intel install.
 #:
 #:  Commands, in the order you run them:
-#:    inventory   List what the Intel install holds. Read-only.
+#:    inventory   List what the Intel install holds, including commands that
+#:                only it provides and would disappear with it. Read-only.
 #:    plan        Write an editable migration plan. Read-only apart from the plan file.
+#:                Rows are install, drop, skip or missing. 'missing' is a command
+#:                you used recently that nothing on Apple Silicon provides.
 #:    install     Install the plan's tools into /opt/homebrew (needs --yes).
 #:    uninstall   Remove the Intel Homebrew (needs --yes; asks for sudo).
+#:                Refuses while the plan has 'missing' commands: change them to
+#:                'drop', or give them a package target and 'install'.
 #:
 #:  Options:
 #:    --since <N>[d|m|y]  inventory/plan: keep tools used within this period (default 12m).
@@ -21,7 +26,7 @@
 
 set -uo pipefail
 
-VERSION="0.2.0"
+VERSION="0.2.1"
 INTEL_PREFIX="${BIM_INTEL_PREFIX:-/usr/local}"
 ARM_PREFIX="${BIM_ARM_PREFIX:-/opt/homebrew}"
 # Folders that still hold commands once the Intel Homebrew is gone.

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.1
+
+- `--help` describes the 0.2.0 behaviour: `inventory` lists commands that
+  would disappear, plan rows can be `missing`, and `uninstall` refuses while
+  any are left.
+
 ## 0.2.0
 
 - Find commands that only the Intel Homebrew provides, including ones from
